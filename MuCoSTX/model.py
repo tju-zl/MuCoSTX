@@ -44,9 +44,10 @@ class Model(Module):
         loss_ctr = self.info_nce(p, p1, p2, temperature=0.05)
         # print(f'rec loss {loss_rec.item()}, ctr loss {loss_ctr.item()}')
         loss_orth = torch.mean(torch.sum(p*batch_emb, dim=1)**2)
-        loss_pano = torch.mean(torch.sum(batch_emb.pow(2), dim=1))
+        # loss_pano = torch.mean(torch.sum(batch_emb.pow(2), dim=1))
+        loss_pano = torch.mean(torch.sum(torch.abs(batch_emb), dim=1))
         
-        return loss_rec + loss_ctr + 0.1*loss_orth + 0.1*loss_pano
+        return loss_rec + loss_ctr + 0.1*(loss_orth + loss_pano)
     
 
 class InfoNCE(nn.Module):
