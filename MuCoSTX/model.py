@@ -50,6 +50,42 @@ class Model(Module):
         return loss_rec + loss_ctr + 0.1*(loss_orth + loss_pano)
     
 
+class ModelHD(Module):
+    def __init__(self, args, in_dim):
+        super().__init__()
+        self.args = args
+        
+        self.encoder = GCNConv(in_dim, args.latent_dim, flow=args.flow, improved=True)
+        self.decoder = GCNConv(args.latent_dim, in_dim, flow=args.flow, improved=True)
+       
+        self.norm = BatchNorm(args.latent_dim)
+        self.act = nn.ELU()
+        self.info_nce = InfoNCE()
+        
+    def forward(self, x, n_x, s_edge_index, sf_edge_index):
+        x_p = mask_feature(x, p=0.2)[0]
+        
+        hi = self.encoder(x, s_edge_index)
+        h = self.decoder(hi, s_edge_index)
+
+        h0 = self.act(self.norm(hi))
+        
+        h1 = self.encoder(x_p, sf_edge_index)
+        h1 = self.act(self.norm(h1))
+        
+        h2 = self.encoder(n_x, s_edge_index)
+        h2 = self.act(self.norm(h2))
+        
+        loss = self.compute_loss(x, h, h0, h1, h2)
+        return hi, h, loss
+        
+    def compute_loss(self, x, y, p, p1, p2):
+        loss_rec = F.mse_loss(x, y)
+        loss_ctr = self.info_nce(p, p1, p2, temperature=0.05)
+        
+        return loss_rec + loss_ctr
+
+
 class InfoNCE(nn.Module):
     def __init__(self, reduction='mean', negative_mode='unpaired'):
         super().__init__()
