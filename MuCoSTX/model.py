@@ -46,7 +46,7 @@ class Model(Module):
         loss_orth = torch.mean(torch.sum(p*batch_emb, dim=1)**2)
         loss_pano = torch.mean(torch.sum(batch_emb.pow(2), dim=1))
         
-        return loss_rec + loss_ctr + 0.1*loss_orth + loss_pano
+        return loss_rec + loss_ctr + 0.1*loss_orth + 0.1*loss_pano
     
 
 class InfoNCE(nn.Module):

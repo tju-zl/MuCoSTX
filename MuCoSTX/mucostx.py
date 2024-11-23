@@ -1,10 +1,12 @@
 import torch
 import scanpy as sc
+import anndata as ad
 import tqdm.notebook as tq
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
+from torch.optim.lr_scheduler import StepLR
 import numpy as np
 from .model import Model
 from .utils import *
@@ -20,8 +22,13 @@ class MuCoSTX:
         self.x_list = []
         self.args.n_adata = len(adata_list)
         
+        # compute the global hvg
+        combined_adata = ad.concat(adata_list.copy(), join='inner')
+        sc.pp.highly_variable_genes(combined_adata, flavor="seurat_v3", n_top_genes=3000)
+        global_hvg = combined_adata.var_names[combined_adata.var['highly_variable']]
+        
         for i, sec in enumerate(adata_list):
-            adata, spatial_edge = self.adata_process(sec)
+            adata, spatial_edge = self.adata_process(sec, global_hvg)
             raw_feature = torch.FloatTensor(adata.X).to(self.device)
             # add batch number to last dim of X
             batch_size = raw_feature.shape[0]
@@ -36,8 +43,9 @@ class MuCoSTX:
         print(self.spe_all, self.fee_all)
         
         self.model = Model(self.args, raw_feature.shape[1]-1).to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=1e-4, eps=1e-4 if args.amp else 1e-8)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
+        # self.scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+        # self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.9)
     
     def train_emb(self):
         losses = []
@@ -48,23 +56,24 @@ class MuCoSTX:
             running_loss = 0
             
             for batch in loader:
-                with torch.cuda.amp.autocast(enabled=self.args.amp):
-                    x = batch.x[:, :-1]
-                    b_idx = batch.x[:, -1]
-                    s_edge_index = batch.edge_index[:, batch.edge_attr == 0]
-                    sf_edge_index = batch.edge_index
-                    n_x = self.fee_all.x[np.random.choice(len(self.fee_all.x), size=len(x), replace=False)][:, :-1]
-                    self.optimizer.zero_grad()
-                    loss = self.model(x, n_x, b_idx, s_edge_index, sf_edge_index)[-1]
-                    # loss.backward()
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.step()
-                    running_loss += loss.item()
-                
+                # with torch.cuda.amp.autocast(enabled=self.args.amp):
+                x = batch.x[:, :-1]
+                b_idx = batch.x[:, -1]
+                s_edge_index = batch.edge_index[:, batch.edge_attr == 0]
+                sf_edge_index = batch.edge_index
+                n_x = self.fee_all.x[np.random.choice(len(self.fee_all.x), size=len(x), replace=False)][:, :-1]
+                self.optimizer.zero_grad()
+                loss = self.model(x, n_x, b_idx, s_edge_index, sf_edge_index)[-1]
+                loss.backward()
+                # self.scaler.scale(loss).backward()
+                # self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
+                # self.scaler.step(self.optimizer)
+                # self.scaler.update()
+                self.optimizer.step()
+                running_loss += loss.item()
+            # self.scheduler.step()
+            
             losses.append(running_loss)
             print(f'x dim {len(x)}, running loss: {running_loss}')
             
@@ -97,15 +106,17 @@ class MuCoSTX:
                 self.new_adata_list[idx].obsm['mx'] = latent.cpu().detach().numpy()
         return self.new_adata_list
         
-    def adata_process(self, adata):
-        adata.var_names_make_unique()
-        sc.pp.filter_genes(adata, min_cells=10)
+    def adata_process(self, adata, global_hvg):
+        # adata.var_names_make_unique()
+        # sc.pp.filter_genes(adata, min_cells=10)
         sc.pp.filter_cells(adata, min_genes=200)
-        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
+        # sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
+        adata = adata[:, global_hvg]
         sc.pp.scale(adata, zero_center=True, max_value=10)
-        adata = adata[:, adata.var['highly_variable']]
+        # adata = adata[:, adata.var['highly_variable']]
+        
         spatial_edge = spatial_rknn(torch.FloatTensor(adata.obsm['spatial']), self.args).to('cuda')
         return adata, spatial_edge
     
