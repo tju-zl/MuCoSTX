@@ -160,9 +160,9 @@ class MuCoSTHD:
         self.args = args
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         print('initial')
-        adata, spatial_edge = self.adata_process(adata)
+        self.adata, spatial_edge = self.adata_process(adata)
         print('pre')
-        raw_feature = torch.FloatTensor(adata.X)
+        raw_feature = torch.FloatTensor(self.adata.X)
         self.x = raw_feature.to(self.device)
         self.spa_edge = spatial_edge
         print('spe')
@@ -211,12 +211,12 @@ class MuCoSTHD:
         plt.plot(x, losses)
         plt.show()
             
-    def get_adata_new(self, adata):
+    def get_adata_new(self):
         self.model.eval()
         with torch.no_grad():
             latent = self.model.encoder(self.x, self.spa_edge)
-            adata.obsm['mx'] = latent.cpu().detach().numpy()
-        return adata
+            self.adata.obsm['mx'] = latent.cpu().detach().numpy()
+        return self.adata
         
     def adata_process(self, adata):
         sc.pp.filter_genes(adata, min_cells=10)
