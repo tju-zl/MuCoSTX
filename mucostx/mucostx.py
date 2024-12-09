@@ -7,8 +7,9 @@ from sklearn.decomposition import PCA
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch.optim.lr_scheduler import StepLR
+import torch.nn.functional as F
 import numpy as np
-from .model import Model, ModelHD
+from .model import Model, ModelHD, Model1
 from .utils import *
 
 
@@ -34,6 +35,17 @@ class MuCoSTX:
             batch_size = raw_feature.shape[0]
             batch_idx = torch.full((batch_size, 1), i, dtype=torch.float32, device=self.device)
             raw_feature = torch.cat([raw_feature, batch_idx], dim=-1)
+            # todo add coordination information, append 2 dim.
+            spatial_coords = adata.obsm['spatial']
+            # min_vals = spatial_coords.min(axis=0)
+            # max_vals = spatial_coords.max(axis=0)
+            # spatial_coords_normalized = (spatial_coords - min_vals) / (max_vals - min_vals)
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            spatial_coords_standardized = scaler.fit_transform(spatial_coords)
+            coor = torch.tensor(spatial_coords_standardized, dtype=torch.float32, device=self.device)
+            raw_feature = torch.cat([raw_feature, coor], dim=-1)
+            
             self.new_adata_list.append(adata)
             self.spe_list.append(spatial_edge)
             self.x_list.append(raw_feature)
@@ -43,7 +55,7 @@ class MuCoSTX:
         self.fee_all = self.get_fea_mnn()
         print(self.spe_all, self.fee_all)
         
-        self.model = Model(self.args, raw_feature.shape[1]-1).to(self.device)
+        self.model = Model(self.args, raw_feature.shape[1]-3).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
         # self.scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
         # self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.9)
@@ -52,19 +64,20 @@ class MuCoSTX:
         losses = []
         self.model.train()
         loader = NeighborLoader(self.fee_all, num_neighbors=[-1], 
-                                batch_size=512, shuffle=True)
+                                batch_size=256, shuffle=True)
         for ep in tq.tqdm(range(1, 101)):
             running_loss = 0
             
             for batch in loader:
                 # with torch.cuda.amp.autocast(enabled=self.args.amp):
-                x = batch.x[:, :-1]
-                b_idx = batch.x[:, -1]
+                x = batch.x[:, :-3]
+                b_idx = batch.x[:, -3]
+                coor = batch.x[:, -2:]
                 s_edge_index = batch.edge_index[:, batch.edge_attr == 0]
                 sf_edge_index = batch.edge_index
-                n_x = self.fee_all.x[np.random.choice(len(self.fee_all.x), size=len(x), replace=False)][:, :-1]
+                n_x = self.fee_all.x[np.random.choice(len(self.fee_all.x), size=len(x), replace=False)][:, :-3]
                 self.optimizer.zero_grad()
-                loss = self.model(x, n_x, b_idx, s_edge_index, sf_edge_index)[-1]
+                loss = self.model(x, n_x, b_idx, s_edge_index, sf_edge_index, coor)[-1]
                 loss.backward()
                 # self.scaler.scale(loss).backward()
                 # self.scaler.unscale_(self.optimizer)
@@ -73,11 +86,11 @@ class MuCoSTX:
                 # self.scaler.update()
                 self.optimizer.step()
                 running_loss += loss.item()
-                print(f'x dim {len(x)} spa edge {s_edge_index.shape[1]} sf edge {sf_edge_index.shape[1]}')
+                # print(f'x dim {len(x)} spa edge {s_edge_index.shape[1]} sf edge {sf_edge_index.shape[1]}')
             # self.scheduler.step()
             
             losses.append(running_loss)
-            print(f'x dim {len(x)}, spa edge{s_edge_index.shape[1]}sf{sf_edge_index.shape[1]}, running loss: {running_loss}')
+            # print(f'x dim {len(x)}, spa edge{s_edge_index.shape[1]}sf{sf_edge_index.shape[1]}, running loss: {running_loss}')
             
         del batch
         del self.fee_all
@@ -87,13 +100,13 @@ class MuCoSTX:
         x = range(1, len(losses) + 1)
         plt.plot(x, np.log(losses))
         plt.show()
-            
+    
     def get_adata_new(self, idx):
         self.model.eval()
         with torch.no_grad():
-            latentb = self.model.encoder(self.x_list[idx][:, :-1], self.spe_list[idx])
+            latentb = self.model.encoder(self.x_list[idx][:, :-3], self.spe_list[idx])
             batch_idx = torch.full((len(latentb), 1), idx, dtype=torch.long, device=self.device)
-            latent = latentb - 0.1*self.model.batch_emb(batch_idx.squeeze())
+            latent = latentb - self.model.batch_emb(batch_idx.squeeze())
             self.new_adata_list[idx].obsm['mxb'] = latentb.cpu().detach().numpy()
             self.new_adata_list[idx].obsm['mx'] = latent.cpu().detach().numpy()
         return self.new_adata_list[idx]
@@ -102,24 +115,27 @@ class MuCoSTX:
         self.model.eval()
         with torch.no_grad():
             for idx in range(self.args.n_adata):
-                latentb = self.model.encoder(self.x_list[idx][:, :-1], self.spe_list[idx])
+                latentb = self.model.encoder(self.x_list[idx][:, :-3], self.spe_list[idx])
                 batch_idx = torch.full((len(latentb), 1), idx, dtype=torch.long, device=self.device)
                 # print(batch_idx.shape, self.model.batch_emb(batch_idx.squeeze()).shape)
-                latent = latentb - 0.1*self.model.batch_emb(batch_idx.squeeze())
+                latent = latentb - self.model.batch_emb(batch_idx.squeeze())
                 self.new_adata_list[idx].obsm['mxb'] = latentb.cpu().detach().numpy()
                 self.new_adata_list[idx].obsm['mx'] = latent.cpu().detach().numpy()
+                # raw_signal = torch.cat((latentb, self.x_list[idx][:, -2:]), dim=1)
+                # isodepth = F.sigmoid(self.model.constrain.encoder(raw_signal))
+                # self.new_adata_list[idx].obs['isodepth'] = isodepth.cpu().detach().numpy()
+                
         return self.new_adata_list
         
     def adata_process(self, adata, global_hvg):
         # adata.var_names_make_unique()
         # sc.pp.filter_genes(adata, min_cells=10)
+        # ! stereo seq 不过滤细胞
         sc.pp.filter_cells(adata, min_genes=200)
-        # sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
         adata = adata[:, global_hvg]
         sc.pp.scale(adata, zero_center=True, max_value=10)
-        # adata = adata[:, adata.var['highly_variable']]
         
         spatial_edge = spatial_rknn(torch.FloatTensor(adata.obsm['spatial']), self.args).to('cuda')
         return adata, spatial_edge
@@ -160,15 +176,178 @@ class MuCoSTX:
     
     def get_fea_mnn(self):
         from .tools.mnn import get_pyg_graph
-        data = get_pyg_graph(self.new_adata_list, k=6, n_components=32)
+        # ! visium 10, stereo-seq 50
+        data = get_pyg_graph(self.new_adata_list, k=10, n_components=32)
         feature_edge = data.edge_index.to('cuda')
         sfe = torch.concatenate([self.spe_all.edge_index, feature_edge], dim=-1)
         sfe_attr = torch.cat([torch.zeros(self.spe_all.edge_index.size(1)), 
                               torch.ones(feature_edge.size(1))], dim=0)
         return Data(x=self.spe_all.x, edge_index=sfe, edge_attr=sfe_attr)
-        
-    
 
+class MuCoSTX1:
+    def __init__(self, adata_list, args):
+        self.args = args
+        self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        
+        self.new_adata_list = []
+        self.spe_list = []
+        self.x_list = []
+        self.args.n_adata = len(adata_list)
+        
+        # compute the global hvg
+        combined_adata = ad.concat(adata_list.copy(), join='inner')
+        sc.pp.highly_variable_genes(combined_adata, flavor="seurat_v3", n_top_genes=3000)
+        global_hvg = combined_adata.var_names[combined_adata.var['highly_variable']]
+        
+        for i, sec in enumerate(adata_list):
+            adata, spatial_edge = self.adata_process(sec, global_hvg)
+            raw_feature = torch.FloatTensor(adata.X).to(self.device)
+            # add batch number to last dim of X
+            batch_size = raw_feature.shape[0]
+            batch_idx = torch.full((batch_size, 1), i, dtype=torch.float32, device=self.device)
+            raw_feature = torch.cat([raw_feature, batch_idx], dim=-1)
+            # todo add coordination information, append 2 dim.
+            spatial_coords = adata.obsm['spatial']
+            # min_vals = spatial_coords.min(axis=0)
+            # max_vals = spatial_coords.max(axis=0)
+            # spatial_coords_normalized = (spatial_coords - min_vals) / (max_vals - min_vals)
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            spatial_coords_standardized = scaler.fit_transform(spatial_coords)
+            coor = torch.tensor(spatial_coords_standardized, dtype=torch.float32, device=self.device)
+            raw_feature = torch.cat([raw_feature, coor], dim=-1)
+            
+            self.new_adata_list.append(adata)
+            self.spe_list.append(spatial_edge)
+            self.x_list.append(raw_feature)
+            
+        self.spe_all = self.tensor_process()
+        # self.fee_all = self.get_fea_edges()
+        self.fee_all = self.get_fea_mnn()
+        print(self.spe_all, self.fee_all)
+        
+        self.model = Model1(self.args, raw_feature.shape[1]-3).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
+        # self.scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+        # self.scheduler = StepLR(self.optimizer, step_size=1, gamma=0.9)
+    
+    def train_emb(self):
+        losses = []
+        self.model.train()
+        loader = NeighborLoader(self.fee_all, num_neighbors=[-1], 
+                                batch_size=256, shuffle=True)
+        for ep in tq.tqdm(range(1, 101)):
+            running_loss = 0
+            
+            for batch in loader:
+                # with torch.cuda.amp.autocast(enabled=self.args.amp):
+                x = batch.x[:, :-3]
+                b_idx = batch.x[:, -3]
+                coor = batch.x[:, -2:]
+                s_edge_index = batch.edge_index[:, batch.edge_attr == 0]
+                sf_edge_index = batch.edge_index
+                n_x = self.fee_all.x[np.random.choice(len(self.fee_all.x), size=len(x), replace=False)][:, :-3]
+                self.optimizer.zero_grad()
+                loss = self.model(x, n_x, b_idx, s_edge_index, sf_edge_index, coor)[-1]
+                loss.backward()
+                # self.scaler.scale(loss).backward()
+                # self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
+                # self.scaler.step(self.optimizer)
+                # self.scaler.update()
+                self.optimizer.step()
+                running_loss += loss.item()
+                # print(f'x dim {len(x)} spa edge {s_edge_index.shape[1]} sf edge {sf_edge_index.shape[1]}')
+            # self.scheduler.step()
+            
+            losses.append(running_loss)
+            # print(f'x dim {len(x)}, spa edge{s_edge_index.shape[1]}sf{sf_edge_index.shape[1]}, running loss: {running_loss}')
+            
+        del batch
+        del self.fee_all
+        del self.spe_all
+        torch.cuda.empty_cache()
+        
+        x = range(1, len(losses) + 1)
+        plt.plot(x, np.log(losses))
+        plt.show()
+    
+    def get_adata_new(self, idx):
+        self.model.eval()
+        with torch.no_grad():
+            latentb = self.model.encoder(self.x_list[idx][:, :-3], self.spe_list[idx])
+            batch_idx = torch.full((len(latentb), 1), idx, dtype=torch.long, device=self.device)
+            latent = latentb - self.model.batch_emb(batch_idx.squeeze())
+            self.new_adata_list[idx].obsm['mxb'] = latentb.cpu().detach().numpy()
+            self.new_adata_list[idx].obsm['mx'] = latent.cpu().detach().numpy()
+        return self.new_adata_list[idx]
+    
+    def get_adata_all(self):
+        self.model.eval()
+        with torch.no_grad():
+            for idx in range(self.args.n_adata):
+                latentb = self.model.encoder(self.x_list[idx][:, :-3], self.spe_list[idx])
+                self.new_adata_list[idx].obsm['mxb'] = latentb.cpu().detach().numpy()
+               
+        return self.new_adata_list
+        
+    def adata_process(self, adata, global_hvg):
+        # adata.var_names_make_unique()
+        # sc.pp.filter_genes(adata, min_cells=10)
+        # ! stereo seq 不过滤细胞
+        sc.pp.filter_cells(adata, min_genes=200)
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+        adata = adata[:, global_hvg]
+        sc.pp.scale(adata, zero_center=True, max_value=10)
+        
+        spatial_edge = spatial_rknn(torch.FloatTensor(adata.obsm['spatial']), self.args).to('cuda')
+        return adata, spatial_edge
+    
+    def tensor_process(self):
+        graphs = (Data(x=self.x_list[i], edge_index=self.spe_list[i]) for i in range(self.args.n_adata))
+        # 合并图
+        all_edge_indices = []
+        all_node_features = []
+        node_offset = 0
+
+        for graph in graphs:
+            # 调整 edge_index 的节点编号
+            edge_index = graph.edge_index + node_offset
+            all_edge_indices.append(edge_index)
+            # 累积节点特征
+            all_node_features.append(graph.x)
+            # 更新节点偏移
+            node_offset += graph.x.size(0)
+
+        # 合并所有图的 edge_index 和 x
+        merged_edge_index = torch.cat(all_edge_indices, dim=1)
+        merged_node_features = torch.cat(all_node_features, dim=0)
+
+        # 构建合并后的图
+        merged_graph = Data(x=merged_node_features, edge_index=merged_edge_index)
+        return merged_graph
+    
+    def get_fea_edges(self):
+        x = self.spe_all.x
+        pca = PCA(n_components=self.args.latent_dim, random_state=self.args.seed)
+        embedding = pca.fit_transform(x.cpu().numpy())
+        feature_edge = feature_knn(torch.FloatTensor(embedding).to('cuda'), self.args)
+        sfe = torch.concatenate([self.spe_all.edge_index, feature_edge], dim=-1)
+        sfe_attr = torch.cat([torch.zeros(self.spe_all.edge_index.size(1)), 
+                              torch.ones(feature_edge.size(1))], dim=0)
+        return Data(x=x, edge_index=sfe, edge_attr=sfe_attr)
+    
+    def get_fea_mnn(self):
+        from .tools.mnn import get_pyg_graph
+        # ! visium 10, stereo-seq 50
+        data = get_pyg_graph(self.new_adata_list, k=50, n_components=32)
+        feature_edge = data.edge_index.to('cuda')
+        sfe = torch.concatenate([self.spe_all.edge_index, feature_edge], dim=-1)
+        sfe_attr = torch.cat([torch.zeros(self.spe_all.edge_index.size(1)), 
+                              torch.ones(feature_edge.size(1))], dim=0)
+        return Data(x=self.spe_all.x, edge_index=sfe, edge_attr=sfe_attr) 
+    
 class MuCoSTHD:
     def __init__(self, adata, args):
         self.args = args

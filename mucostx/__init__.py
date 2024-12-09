@@ -2,6 +2,6 @@
 # Code Author: Lei Zhang
 # Date: Nov.21, 2024
 
-from .mucostx import MuCoSTX
+from .mucostx import MuCoSTX, MuCoSTX1
 from .config import config
 from .utils import *

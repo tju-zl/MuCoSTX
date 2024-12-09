@@ -4,6 +4,7 @@ import faiss
 import scanpy as sc
 import anndata as ad
 from torch_geometric.data import Data
+from torch_geometric.utils import to_undirected
 
 
 # * project to common pca space
@@ -45,7 +46,7 @@ def cal_pair_mnn(adata1, adata2, start_idx_1, start_idx_2, k=10):
         for j in indices_1_to_2[i]:
             if i in indices_2_to_1[j]:
                 mnn_edges.append((i + start_idx_1, j + start_idx_2))
-    print(f'section {i} and {j} has {len(mnn_edges)} mnn edges')
+    print(f'section {len(X1)} and {len(X2)} has {len(mnn_edges)} mnn edges')
     
     return mnn_edges
 
@@ -82,6 +83,8 @@ def get_pyg_graph(adata_list, k=10, n_components=50):
     edge_index = np.array(edge_list).T
     
     edge_index = torch.tensor(edge_index, dtype=torch.long)
+    # ! 转成无向边
+    edge_index = to_undirected(edge_index)
     x = torch.tensor(X_all, dtype=torch.float)
     
     data = Data(x=x, edge_index=edge_index)

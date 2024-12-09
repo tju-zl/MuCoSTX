@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-from torch.nn import Module
+from torch.nn import Module, Sequential
 from torch_geometric.nn import GCNConv, BatchNorm, Linear
 from torch_geometric.utils import mask_feature
 
@@ -14,27 +14,35 @@ class Model(Module):
         self.encoder = GCNConv(in_dim, args.latent_dim, flow=args.flow, improved=True)
         self.decoder = GCNConv(args.latent_dim, in_dim, flow=args.flow, improved=True)
         self.batch_emb = nn.Embedding(args.n_adata, args.latent_dim)
+        
+        if args.elastic_corr:
+            self.constrain = SpatialConstrain(args)
        
         self.norm = BatchNorm(args.latent_dim)
         self.act = nn.ELU()
         self.info_nce = InfoNCE()
         
-    def forward(self, x, n_x, batch_k, s_edge_index, sf_edge_index):
+    def forward(self, x, n_x, batch_k, s_edge_index, sf_edge_index, coor=None):
         x_p = mask_feature(x, p=0.2)[0]
         int_idx = batch_k.to(torch.long)
         batch_emb = self.batch_emb(int_idx)
         
         hio = self.encoder(x, s_edge_index)
         h = self.decoder(hio, s_edge_index)
-        hi = hio - 0.1*batch_emb
+        hi = hio - batch_emb            # ! visium 1,stereo-seq 0.1
         h0 = self.act(self.norm(hi))
         
         h1 = self.encoder(x_p, sf_edge_index)
-        h1 = h1 - 0.1*batch_emb
+        h1 = h1 - batch_emb
         h1 = self.act(self.norm(h1))
         
         h2 = self.encoder(n_x, s_edge_index)
         h2 = self.act(self.norm(h2))
+        
+        # if self.args.elastic_corr:
+        #     raw_signal = torch.cat((hio, coor), dim=1)
+        #     spa_inter, corr_signal = self.constrain(raw_signal)
+        #     # rec_coor = self.elastic(hi)
         
         loss = self.compute_loss(x, h, hio, hi, h0, h1, h2, batch_emb)
         return hi, h, loss
@@ -46,11 +54,74 @@ class Model(Module):
         # print(f'rec loss {loss_rec.item()}, ctr loss {loss_ctr.item()}')
         
         loss_orth = torch.mean(torch.sum(p*batch_emb, dim=1)**2)
+        
         # loss_pano = torch.mean(torch.sum(batch_emb.pow(2), dim=1))
+        # loss_pano = torch.mean(torch.sum(torch.abs(batch_emb), dim=1))  # 正则化强度 0.1/0.01
+        # todo pano 修改为相对强度
+        signal_strength = torch.sum(torch.abs(hi), dim=1)
+        batch_strength = torch.sum(torch.abs(batch_emb), dim=1)
+        # ! visium 0.1*, stereo-seq 5
+        loss_pano = 0.1 * torch.log1p(torch.mean(batch_strength/signal_strength))
         
-        # loss_pano = torch.mean(torch.sum(torch.abs(batch_emb), dim=1))
         
-        return loss_rec + loss_ctr + loss_orth + loss_okk #+ loss_pano
+        # if self.args.elastic_corr:
+        #     loss_constrain = self.info_nce(corr_signal, hi, temperature=0.01)
+            
+        #     print(f'rec: {loss_rec}, ctr: {loss_ctr}, orth: {loss_orth}, const: {loss_constrain}, pano: {loss_pano}')
+        #     return loss_rec + loss_ctr + loss_orth + loss_constrain + loss_pano
+        print(f'rec: {loss_rec}, ctr: {loss_ctr}, orth: {loss_orth}, pano: {loss_pano} {loss_okk}')
+        return loss_rec + loss_ctr + loss_orth + loss_pano + loss_okk
+    
+class Model1(Module):
+    def __init__(self, args, in_dim):
+        super().__init__()
+        self.args = args
+        
+        self.encoder = GCNConv(in_dim, args.latent_dim, flow=args.flow, improved=True)
+        self.decoder = GCNConv(args.latent_dim, in_dim, flow=args.flow, improved=True)
+        self.batch_emb = nn.Embedding(args.n_adata, args.latent_dim)
+        
+        if args.elastic_corr:
+            self.constrain = SpatialConstrain(args)
+       
+        self.norm = BatchNorm(args.latent_dim)
+        self.act = nn.ELU()
+        self.info_nce = InfoNCE()
+        
+    def forward(self, x, n_x, batch_k, s_edge_index, sf_edge_index, coor=None):
+        x_p = mask_feature(x, p=0.2)[0]
+        
+        hio = self.encoder(x, s_edge_index)
+        hi = self.decoder(hio, s_edge_index)
+        h0 = self.act(self.norm(hio))
+        
+        h1 = self.encoder(x_p, sf_edge_index)
+        h1 = self.act(self.norm(h1))
+        
+        h2 = self.encoder(n_x, s_edge_index)
+        h2 = self.act(self.norm(h2))
+        
+        loss = self.compute_loss(x,  hi, h0, h1, h2)
+        return hi, loss
+        
+    def compute_loss(self, x, y, p, p1, p2):
+        loss_rec = F.mse_loss(x, y)
+        loss_ctr = self.info_nce(p, p1, p2, temperature=0.05)
+
+        return loss_rec + loss_ctr
+    
+class SpatialConstrain(Module):
+    def __init__(self, args):
+        super().__init__()
+        self.encoder = Sequential(Linear(2+args.latent_dim, 2+args.latent_dim), nn.ELU(), Linear(2+args.latent_dim, 2+args.latent_dim), nn.ELU(), Linear(2+args.latent_dim, 1))
+        self.act = nn.Sigmoid()
+        self.decoder = Sequential(Linear(1, args.latent_dim), nn.ELU(), Linear(args.latent_dim, args.latent_dim), nn.ELU(), Linear(args.latent_dim, args.latent_dim))
+        
+    def forward(self, coor):
+        spa_inter = self.act(self.encoder(coor))
+        # spa_inter = self.encoder(coor)
+        rec_emb = self.decoder(spa_inter)
+        return spa_inter, rec_emb
     
 
 class ModelHD(Module):

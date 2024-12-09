@@ -22,6 +22,7 @@ def config():
     parser.add_argument('--latent_dim', type=int, default=64, help='dim of latent space')
     parser.add_argument('--flow', type=str, default='source_to_target')
     parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--elastic_corr', default=False, action='store_true')
 
     # training control
     parser.add_argument('--lr', type=float, default=1e-3)
